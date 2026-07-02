@@ -2,8 +2,9 @@
 """Check Codex or Claude auth files without printing secrets.
 
 Provider selection:
-  - codex:  checks Codex auth.json / auth.json.* files
-  - claude: checks Claude credentials.json / .credentials.json files
+  - codex:  checks Codex auth.json, auth.json.*, authN.json files
+  - claude: checks Claude credentials.json, credentials.json.*,
+             credentialsN.json, and hidden .credentials variants
   - auto:   infers provider from file name and JSON shape
 
 The script is read-only. It never prints access tokens, refresh tokens, API
@@ -141,16 +142,29 @@ def parse_error_detail(body: bytes) -> str | None:
 
 
 def is_codex_auth_name(name: str) -> bool:
-    return name == "auth.json" or name.startswith("auth.json.")
+    return (
+        name == "auth.json"
+        or name.startswith("auth.json.")
+        or numbered_json_name(name, "auth")
+    )
 
 
 def is_claude_auth_name(name: str) -> bool:
     return (
         name == "credentials.json"
         or name.startswith("credentials.json.")
+        or numbered_json_name(name, "credentials")
         or name == ".credentials.json"
         or name.startswith(".credentials.json.")
+        or numbered_json_name(name, ".credentials")
     )
+
+
+def numbered_json_name(name: str, stem: str) -> bool:
+    if not name.startswith(stem) or not name.endswith(".json"):
+        return False
+    suffix = name[len(stem) : -len(".json")]
+    return suffix.isdigit()
 
 
 def safe_iter_dirs(path: Path) -> list[Path]:

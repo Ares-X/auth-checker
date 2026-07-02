@@ -4,8 +4,8 @@
 
 It supports:
 
-- Codex ChatGPT auth files: `auth.json`, `auth.json.*`
-- Claude credentials files: `credentials.json`, `credentials.json.*`, `.credentials.json`, `.credentials.json.*`
+- Codex ChatGPT auth files: `auth.json`, `auth.json.*`, `auth1.json`
+- Claude credentials files: `credentials.json`, `credentials.json.*`, `credentials1.json`, `.credentials.json`, `.credentials.json.*`, `.credentials1.json`
 - Single-file checks
 - Directory scans up to two subdirectory levels
 - Auto provider detection
@@ -79,14 +79,20 @@ Codex:
   auth.json.1
   auth.json.2
   auth.json.*
+  auth1.json
+  auth2.json
 
 Claude:
   credentials.json
   credentials.json.1
   credentials.json.*
+  credentials1.json
+  credentials2.json
   .credentials.json
   .credentials.json.1
   .credentials.json.*
+  .credentials1.json
+  .credentials2.json
 ```
 
 ## Output
