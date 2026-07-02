@@ -9,6 +9,7 @@ It supports:
 - Single-file checks
 - Directory scans up to two subdirectory levels
 - URL list checks for remote JSON auth files
+- Default local save for usable auth JSON files downloaded from URL lists
 - Optional concurrent checks with worker threads
 - Auto provider detection
 - Rolling terminal output during scans
@@ -38,6 +39,18 @@ Check auth JSON files from a URL list:
 
 ```bash
 python3 auth-checker/check_ai_auth.py -k auto -l ./auth-urls.txt
+```
+
+When `-l/--url-list` is used, usable downloaded auth JSON files are saved by default under:
+
+```text
+saved-url-auths/YYYYMMDD-HHMMSS/
+```
+
+Disable URL auth saving:
+
+```bash
+python3 auth-checker/check_ai_auth.py -k auto -l ./auth-urls.txt -ns
 ```
 
 Scan faster with concurrent workers:
@@ -123,6 +136,21 @@ URL checks support the same provider detection, expiry checks, network probes, c
 
 Use `--workers N` to check several files or URLs concurrently. Values greater than `1` enable concurrency. Rolling output is printed as each check finishes, so concurrent output is completion order, not input order.
 
+Usable URL auth files are saved by default. Each script run creates a folder named from the script start time:
+
+```text
+saved-url-auths/20260703-231530/
+001-codex-auth.json
+002-claude-.credentials.json
+```
+
+Options:
+
+```text
+-ns, --no-save-successful-url-auths   Do not save usable downloaded auth files
+--url-auth-save-dir DIR               Parent directory for saved auth files
+```
+
 ## Output
 
 Human output is a table:
@@ -160,6 +188,7 @@ Directory scans and URL-list checks print results as each file or URL completes.
 
 ```text
 summary: usable=2/3 status=attention_required provider=auto scan_dir=/path
+saved_auths=2 dir=saved-url-auths/20260703-231530
 ==== usable auth files ====
 ...
 ===========================
@@ -205,6 +234,8 @@ python3 auth-checker/check_ai_auth.py -k auto -d /path/to/accounts --no-network
 - It does not write back to any auth file.
 - It never prints token, refresh token, API key, or OAuth secret values.
 - URL-list mode downloads credential JSON from the listed URLs. Only use trusted URLs, prefer HTTPS, and do not publish auth files publicly.
+- URL-list mode saves usable downloaded auth files by default under `saved-url-auths/`. That directory is ignored by this repository's `.gitignore`.
+- Use `-ns` when you want URL checks without local credential copies.
 
 ## Useful Examples
 
@@ -224,6 +255,12 @@ Concurrent URL-list check:
 
 ```bash
 python3 auth-checker/check_ai_auth.py -k auto -l ./auth-urls.txt --workers 8
+```
+
+Concurrent URL-list check without saving downloaded auth files:
+
+```bash
+python3 auth-checker/check_ai_auth.py -k auto -l ./auth-urls.txt --workers 8 -ns
 ```
 
 Check a copied Codex auth file:

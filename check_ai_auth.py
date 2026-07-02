@@ -38,6 +38,8 @@ DEFAULT_CLAUDE_AUTH_FILE = "~/.claude/.credentials.json"
 DEFAULT_CLIENT_VERSION = "0.0.0"
 DEFAULT_MIN_VALID_SECONDS = 300
 DEFAULT_TIMEOUT_SECONDS = 15
+DEFAULT_URL_AUTH_SAVE_PARENT = "saved-url-auths"
+SCRIPT_STARTED_AT_LABEL = dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
 USABLE_STATUSES = {"valid", "locally_valid"}
 COLOR_GREEN = "\033[32m"
 COLOR_RED = "\033[31m"
@@ -739,8 +741,13 @@ def fetch_json_from_url(url: str, timeout: float) -> dict[str, Any]:
     return value
 
 
-def make_report(
+def is_http_url(value: str) -> bool:
+    return value.startswith("http://") or value.startswith("https://")
+
+
+def make_report_from_payload(
     auth_path: Path | str,
+    payload: dict[str, Any],
     *,
     kind: Provider,
     min_valid_seconds: int,
@@ -748,10 +755,6 @@ def make_report(
     client_version: str,
     timeout: float,
 ) -> tuple[dict[str, Any], int]:
-    if isinstance(auth_path, str) and (auth_path.startswith("http://") or auth_path.startswith("https://")):
-        payload = fetch_json_from_url(auth_path, timeout)
-    else:
-        payload = load_json(Path(auth_path))
     provider = infer_provider(auth_path, payload, kind)
     if provider == "codex":
         return make_codex_report(
@@ -771,6 +774,30 @@ def make_report(
             timeout=timeout,
         )
     raise ValueError(f"unsupported provider: {provider}")
+
+
+def make_report(
+    auth_path: Path | str,
+    *,
+    kind: Provider,
+    min_valid_seconds: int,
+    no_network: bool,
+    client_version: str,
+    timeout: float,
+) -> tuple[dict[str, Any], int]:
+    if isinstance(auth_path, str) and is_http_url(auth_path):
+        payload = fetch_json_from_url(auth_path, timeout)
+    else:
+        payload = load_json(Path(auth_path))
+    return make_report_from_payload(
+        auth_path,
+        payload,
+        kind=kind,
+        min_valid_seconds=min_valid_seconds,
+        no_network=no_network,
+        client_version=client_version,
+        timeout=timeout,
+    )
 
 
 def make_error_report(auth_path: Path | str, exc: Exception, kind: Provider) -> dict[str, Any]:
@@ -795,6 +822,38 @@ def emit_result(
         return
     with emit_lock:
         on_result(report)
+
+
+def safe_file_name(value: str) -> str:
+    cleaned = "".join(char if char.isalnum() or char in "._-" else "_" for char in value)
+    cleaned = cleaned.strip("._-")
+    return cleaned or "auth.json"
+
+
+def auth_file_name_from_url(url: str, index: int, provider: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    url_name = Path(urllib.parse.unquote(parsed.path)).name or "auth.json"
+    safe_url_name = safe_file_name(url_name)
+    if not safe_url_name.endswith(".json"):
+        safe_url_name = f"{safe_url_name}.json"
+    return f"{index:03d}-{safe_file_name(provider)}-{safe_url_name}"
+
+
+def save_url_auth_payload(
+    save_dir: Path,
+    *,
+    url: str,
+    index: int,
+    report: dict[str, Any],
+    payload: dict[str, Any],
+) -> Path:
+    provider = str(report.get("provider", "unknown"))
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_dir / auth_file_name_from_url(url, index, provider)
+    with save_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    return save_path
 
 
 def make_scan_report(
@@ -886,22 +945,38 @@ def make_url_list_report(
     client_version: str,
     timeout: float,
     workers: int = 1,
+    save_successful_dir: Path | None = None,
     on_result: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, Any], int]:
     results: list[dict[str, Any]] = []
     exit_codes: list[int] = []
+    saved_count = 0
     emit_lock = Lock() if workers > 1 and on_result is not None else None
 
-    def process_url(url: str) -> tuple[dict[str, Any], int]:
+    def process_url(index: int, url: str) -> tuple[dict[str, Any], int]:
         try:
-            report, exit_code = make_report(
+            payload = fetch_json_from_url(url, timeout)
+            report, exit_code = make_report_from_payload(
                 url,
+                payload,
                 kind=kind,
                 min_valid_seconds=min_valid_seconds,
                 no_network=no_network,
                 client_version=client_version,
                 timeout=timeout,
             )
+            if (
+                save_successful_dir is not None
+                and str(report.get("status", "unknown")) in USABLE_STATUSES
+            ):
+                saved_path = save_url_auth_payload(
+                    save_successful_dir,
+                    url=url,
+                    index=index,
+                    report=report,
+                    payload=payload,
+                )
+                report["saved_auth_file"] = str(saved_path)
         except Exception as exc:
             report = make_error_report(url, exc, kind)
             exit_code = 2
@@ -911,14 +986,17 @@ def make_url_list_report(
     if workers > 1:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(process_url, url): url for url in urls}
+            futures = {
+                executor.submit(process_url, index, url): url
+                for index, url in enumerate(urls, start=1)
+            }
             for future in as_completed(futures):
                 report, exit_code = future.result()
                 results.append(report)
                 exit_codes.append(exit_code)
     else:
-        for url in urls:
-            report, exit_code = process_url(url)
+        for index, url in enumerate(urls, start=1):
+            report, exit_code = process_url(index, url)
             results.append(report)
             exit_codes.append(exit_code)
 
@@ -929,6 +1007,8 @@ def make_url_list_report(
         status_counts[status] = status_counts.get(status, 0) + 1
         if status in USABLE_STATUSES:
             usable_count += 1
+        if result.get("saved_auth_file"):
+            saved_count += 1
 
     if not urls:
         overall_exit = 2
@@ -948,6 +1028,8 @@ def make_url_list_report(
             "max_depth": 1,
             "auth_file_count": len(urls),
             "usable_count": usable_count,
+            "saved_auth_count": saved_count,
+            "saved_auth_dir": str(save_successful_dir) if save_successful_dir else None,
             "status_counts": status_counts,
             "auth_files": results,
         },
@@ -1115,6 +1197,9 @@ def print_scan_item(report: dict[str, Any], *, quiet: bool, color_enabled: bool)
     detail = probe_detail(report)
     if detail:
         print(color_dim(f"  detail: {detail}", color_enabled=color_enabled), flush=True)
+    saved_path = report.get("saved_auth_file")
+    if saved_path:
+        print(color_dim(f"  saved: {saved_path}", color_enabled=color_enabled), flush=True)
 
 
 def print_scan_start(scan_dir: Path, *, kind: Provider, quiet: bool, color_enabled: bool) -> None:
@@ -1134,6 +1219,12 @@ def print_scan_summary(report: dict[str, Any], *, quiet: bool) -> None:
         f"scan_dir={report['scan_dir']}",
         flush=True,
     )
+    saved_dir = report.get("saved_auth_dir")
+    if saved_dir:
+        print(
+            f"saved_auths={report.get('saved_auth_count', 0)} dir={saved_dir}",
+            flush=True,
+        )
 
 
 def print_usable_summary(
@@ -1157,14 +1248,19 @@ def print_usable_summary(
             provider = item.get("provider", "unknown")
             status = item.get("status", "unknown")
             path = item.get("auth_file", "unknown")
+            saved_path = item.get("saved_auth_file")
             result = result_label(str(status))
+            saved_suffix = f"\tsaved={saved_path}" if saved_path else ""
             print(
                 f"{colorize_result(result, result, color_enabled=color_enabled)}"
-                f"\t{provider}\t{subscription_plan(item)}\t{status}\t{path}",
+                f"\t{provider}\t{subscription_plan(item)}\t{status}\t{path}{saved_suffix}",
                 flush=True,
             )
         else:
             print(format_table_row(item, color_enabled=color_enabled), flush=True)
+            saved_path = item.get("saved_auth_file")
+            if saved_path:
+                print(color_dim(f"  saved: {saved_path}", color_enabled=color_enabled), flush=True)
     print("===========================", flush=True)
 
 
@@ -1214,6 +1310,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of concurrent workers for scanning or URL checking. Default: 1.",
+    )
+    parser.add_argument(
+        "-ns",
+        "--no-save-successful-url-auths",
+        action="store_true",
+        help="Do not save usable auth JSON files downloaded through --url-list.",
+    )
+    parser.add_argument(
+        "--url-auth-save-dir",
+        default=DEFAULT_URL_AUTH_SAVE_PARENT,
+        help=(
+            "Parent directory for usable auth files downloaded through --url-list. "
+            f"Default: {DEFAULT_URL_AUTH_SAVE_PARENT}."
+        ),
     )
     parser.add_argument(
         "--min-valid-seconds",
@@ -1276,6 +1386,12 @@ def run_once(args: argparse.Namespace) -> int:
                 if line and not line.startswith("#"):
                     urls.append(line)
 
+        save_successful_dir = None
+        if not args.no_save_successful_url_auths:
+            save_successful_dir = (
+                Path(args.url_auth_save_dir).expanduser() / SCRIPT_STARTED_AT_LABEL
+            )
+
         if not args.json:
             print_scan_start(
                 url_list_path,
@@ -1293,6 +1409,7 @@ def run_once(args: argparse.Namespace) -> int:
                 client_version=args.client_version,
                 timeout=args.timeout,
                 workers=args.workers,
+                save_successful_dir=save_successful_dir,
                 on_result=(
                     None
                     if args.json
