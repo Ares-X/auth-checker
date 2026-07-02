@@ -73,6 +73,15 @@ class ClaudeTokenInfo:
     seconds_left: int | None
 
 
+@dataclass(frozen=True)
+class SubscriptionInfo:
+    plan: str
+    source: str
+    raw_type: str | None = None
+    rate_limit_tier: str | None = None
+    billing_type: str | None = None
+
+
 def utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -95,6 +104,15 @@ def b64url_json(segment: str) -> dict[str, Any]:
     padding = "=" * ((4 - len(segment) % 4) % 4)
     raw = base64.urlsafe_b64decode(segment + padding)
     return json.loads(raw.decode("utf-8"))
+
+
+def jwt_payload(token: str | None) -> dict[str, Any] | None:
+    if not token or token.count(".") < 2:
+        return None
+    try:
+        return b64url_json(token.split(".")[1])
+    except Exception:
+        return None
 
 
 def parse_iso_datetime(value: str | None) -> dt.datetime | None:
@@ -231,17 +249,32 @@ def extract_codex_account_id(tokens: dict[str, Any], access_token: str | None) -
     direct = tokens.get("account_id")
     if isinstance(direct, str) and direct:
         return direct
-    if not access_token or access_token.count(".") < 2:
-        return None
-    try:
-        payload = b64url_json(access_token.split(".")[1])
-    except Exception:
+    payload = jwt_payload(access_token)
+    if payload is None:
         return None
     auth_claim = payload.get("https://api.openai.com/auth")
     if not isinstance(auth_claim, dict):
         return None
     account_id = auth_claim.get("chatgpt_account_id")
     return account_id if isinstance(account_id, str) and account_id else None
+
+
+def extract_codex_subscription(access_token: str | None, id_token: str | None) -> SubscriptionInfo:
+    for token_name, token in (("access_token", access_token), ("id_token", id_token)):
+        payload = jwt_payload(token)
+        if not payload:
+            continue
+        auth_claim = payload.get("https://api.openai.com/auth")
+        if not isinstance(auth_claim, dict):
+            continue
+        plan = auth_claim.get("chatgpt_plan_type")
+        if isinstance(plan, str) and plan:
+            return SubscriptionInfo(
+                plan=normalize_plan_value(plan),
+                source=f"codex_{token_name}_jwt",
+                raw_type=plan,
+            )
+    return SubscriptionInfo(plan="unknown", source="not_found")
 
 
 def probe_codex(
@@ -339,6 +372,7 @@ def make_codex_report(
     access_info = decode_codex_jwt(access_token, now_epoch)
     id_info = decode_codex_jwt(id_token, now_epoch)
     account_id = extract_codex_account_id(tokens, access_token)
+    subscription = extract_codex_subscription(access_token, id_token)
     probe = (
         DynamicProbe(False, None, None, "disabled", CODEX_MODELS_URL)
         if no_network or not access_token
@@ -358,6 +392,7 @@ def make_codex_report(
             "auth_file": str(auth_path),
             "last_refresh": payload.get("last_refresh"),
             "min_valid_seconds": min_valid_seconds,
+            "subscription": subscription_info_json(subscription),
             "tokens": {
                 "access_token": codex_token_info_json(access_info),
                 "id_token": codex_token_info_json(id_info),
@@ -408,6 +443,111 @@ def extract_claude_token_info(
         return "oauth", access_token, ClaudeTokenInfo(True, expires_at, seconds_left)
 
     return "", None, ClaudeTokenInfo(False, None, None)
+
+
+def extract_claude_subscription(auth_path: Path, payload: dict[str, Any]) -> SubscriptionInfo:
+    for source, container in (
+        ("claude_credentials_oauthToken", payload.get("oauthToken")),
+        ("claude_credentials_claudeAiOauth", payload.get("claudeAiOauth")),
+        ("claude_credentials_root", payload),
+    ):
+        if not isinstance(container, dict):
+            continue
+        subscription_type = string_value(container.get("subscriptionType"))
+        rate_limit_tier = string_value(container.get("rateLimitTier"))
+        billing_type = string_value(container.get("billingType"))
+        info = subscription_from_claude_fields(
+            subscription_type=subscription_type,
+            rate_limit_tier=rate_limit_tier,
+            billing_type=billing_type,
+            source=source,
+        )
+        if info.plan != "unknown":
+            return info
+
+    claude_json = find_claude_json_for_auth(auth_path)
+    if claude_json is not None:
+        try:
+            claude_payload = load_json(claude_json)
+        except Exception:
+            claude_payload = {}
+        oauth_account = claude_payload.get("oauthAccount")
+        if isinstance(oauth_account, dict):
+            subscription_type = string_value(oauth_account.get("subscriptionType"))
+            rate_limit_tier = string_value(oauth_account.get("organizationRateLimitTier"))
+            billing_type = string_value(oauth_account.get("billingType"))
+            info = subscription_from_claude_fields(
+                subscription_type=subscription_type,
+                rate_limit_tier=rate_limit_tier,
+                billing_type=billing_type,
+                source="claude_json_oauthAccount",
+            )
+            if info.plan != "unknown":
+                return info
+
+    return SubscriptionInfo(plan="unknown", source="not_found")
+
+
+def find_claude_json_for_auth(auth_path: Path) -> Path | None:
+    resolved = auth_path.expanduser().resolve()
+    parents = [resolved.parent, *resolved.parents]
+    for parent in parents:
+        candidate = parent / ".claude.json"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def subscription_from_claude_fields(
+    *,
+    subscription_type: str | None,
+    rate_limit_tier: str | None,
+    billing_type: str | None,
+    source: str,
+) -> SubscriptionInfo:
+    if rate_limit_tier:
+        return SubscriptionInfo(
+            plan=normalize_claude_rate_limit_tier(rate_limit_tier),
+            source=source,
+            raw_type=subscription_type,
+            rate_limit_tier=rate_limit_tier,
+            billing_type=billing_type,
+        )
+    if subscription_type:
+        return SubscriptionInfo(
+            plan=normalize_plan_value(subscription_type),
+            source=source,
+            raw_type=subscription_type,
+            billing_type=billing_type,
+        )
+    if billing_type:
+        return SubscriptionInfo(
+            plan=normalize_claude_billing_type(billing_type),
+            source=source,
+            billing_type=billing_type,
+        )
+    return SubscriptionInfo(plan="unknown", source=source)
+
+
+def normalize_claude_rate_limit_tier(value: str) -> str:
+    prefix = "default_claude_"
+    if value.startswith(prefix):
+        return normalize_plan_value(value[len(prefix) :])
+    return normalize_plan_value(value)
+
+
+def normalize_claude_billing_type(value: str) -> str:
+    if value == "stripe_subscription":
+        return "subscription"
+    return normalize_plan_value(value)
+
+
+def normalize_plan_value(value: str) -> str:
+    return value.strip().lower().replace("-", "_")
+
+
+def string_value(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 def parse_claude_expiry(value: Any, now_epoch: int) -> tuple[str | None, int | None]:
@@ -504,6 +644,7 @@ def make_claude_report(
     timeout: float,
 ) -> tuple[dict[str, Any], int]:
     token_type, token_value, token_info = extract_claude_token_info(payload, int(time.time()))
+    subscription = extract_claude_subscription(auth_path, payload)
     probe = (
         DynamicProbe(False, None, None, "disabled", CLAUDE_MESSAGES_URL)
         if no_network or not token_value
@@ -517,6 +658,7 @@ def make_claude_report(
             "checked_at": utc_now().isoformat(),
             "auth_file": str(auth_path),
             "min_valid_seconds": min_valid_seconds,
+            "subscription": subscription_info_json(subscription),
             "token_type": token_type,
             "token": {
                 "present": token_info.present,
@@ -547,6 +689,16 @@ def probe_json(probe: DynamicProbe) -> dict[str, Any]:
         "detail": probe.detail,
         "endpoint": probe.endpoint,
         "model_count": probe.model_count,
+    }
+
+
+def subscription_info_json(info: SubscriptionInfo) -> dict[str, Any]:
+    return {
+        "plan": info.plan,
+        "source": info.source,
+        "raw_type": info.raw_type,
+        "rate_limit_tier": info.rate_limit_tier,
+        "billing_type": info.billing_type,
     }
 
 
@@ -724,6 +876,27 @@ def probe_detail(report: dict[str, Any]) -> str:
     return ""
 
 
+def subscription_plan(report: dict[str, Any]) -> str:
+    subscription = report.get("subscription")
+    if isinstance(subscription, dict):
+        plan = subscription.get("plan")
+        if isinstance(plan, str) and plan:
+            return plan
+    return "unknown"
+
+
+def subscription_detail(report: dict[str, Any]) -> str:
+    subscription = report.get("subscription")
+    if not isinstance(subscription, dict):
+        return "subscription: unknown"
+    parts = [f"plan={subscription.get('plan', 'unknown')}"]
+    for key in ("source", "raw_type", "rate_limit_tier", "billing_type"):
+        value = subscription.get(key)
+        if value:
+            parts.append(f"{key}={value}")
+    return "subscription: " + " ".join(parts)
+
+
 def format_table_row(report: dict[str, Any], *, color_enabled: bool) -> str:
     status = str(report.get("status", "unknown"))
     result = result_label(status)
@@ -732,6 +905,7 @@ def format_table_row(report: dict[str, Any], *, color_enabled: bool) -> str:
     return (
         f"{result_text} "
         f"{str(report.get('provider', 'unknown')):<8} "
+        f"{subscription_plan(report):<14} "
         f"{status:<24} "
         f"{probe_http(report):<5} "
         f"{expires_in:<12} "
@@ -742,7 +916,7 @@ def format_table_row(report: dict[str, Any], *, color_enabled: bool) -> str:
 
 def print_table_header(*, color_enabled: bool) -> None:
     header = (
-        f"{'RESULT':<15} {'PROVIDER':<8} {'STATUS':<24} {'HTTP':<5} "
+        f"{'RESULT':<15} {'PROVIDER':<8} {'PLAN':<14} {'STATUS':<24} {'HTTP':<5} "
         f"{'EXPIRES_IN':<12} {'EXPIRES_AT':<28} PATH"
     )
     print(color_dim(header, color_enabled=color_enabled), flush=True)
@@ -754,6 +928,7 @@ def print_human(report: dict[str, Any], *, color_enabled: bool) -> None:
     print(format_table_row(report, color_enabled=color_enabled))
     print("")
     print(f"checked_at: {report['checked_at']}")
+    print(subscription_detail(report))
     if report["provider"] == "codex":
         id_token = report["tokens"]["id_token"]
         print(f"last_refresh: {report['last_refresh']}")
@@ -784,7 +959,7 @@ def print_scan_item(report: dict[str, Any], *, quiet: bool, color_enabled: bool)
         result = result_label(str(status))
         print(
             f"{colorize_result(result, result, color_enabled=color_enabled)}"
-            f"\t{provider}\t{status}\t{path}",
+            f"\t{provider}\t{subscription_plan(report)}\t{status}\t{path}",
             flush=True,
         )
         return
@@ -837,7 +1012,7 @@ def print_usable_summary(
             result = result_label(str(status))
             print(
                 f"{colorize_result(result, result, color_enabled=color_enabled)}"
-                f"\t{provider}\t{status}\t{path}",
+                f"\t{provider}\t{subscription_plan(item)}\t{status}\t{path}",
                 flush=True,
             )
         else:
@@ -1013,7 +1188,8 @@ def run_once(args: argparse.Namespace) -> int:
         result = result_label(str(report["status"]))
         print(
             f"{colorize_result(result, result, color_enabled=color_enabled)}"
-            f"\t{report['provider']}\t{report['status']}\t{report['auth_file']}"
+            f"\t{report['provider']}\t{subscription_plan(report)}"
+            f"\t{report['status']}\t{report['auth_file']}"
         )
     else:
         print_human(report, color_enabled=color_enabled)

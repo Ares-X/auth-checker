@@ -94,8 +94,8 @@ Claude:
 Human output is a table:
 
 ```text
-RESULT          PROVIDER STATUS                   HTTP  EXPIRES_IN   EXPIRES_AT                   PATH
-OK              codex    valid                    200   123456s      2026-07-11T10:02:06+00:00    /path/auth.json
+RESULT          PROVIDER PLAN           STATUS                   HTTP  EXPIRES_IN   EXPIRES_AT                   PATH
+OK              codex    plus           valid                    200   123456s      2026-07-11T10:02:06+00:00    /path/auth.json
 ```
 
 Result labels:
@@ -105,6 +105,22 @@ OK        usable
 FAIL      expired, rejected, malformed, or missing token
 UNKNOWN   local token is not expired, but network verification was inconclusive
 ```
+
+`PLAN` is inferred from local non-secret metadata:
+
+- Codex: `chatgpt_plan_type` inside the access-token or id-token JWT claim.
+- Claude: `subscriptionType` / `rateLimitTier` inside `credentials.json`, `.credentials.json`, `oauthToken`, or `claudeAiOauth`.
+- Claude fallback: `.claude.json.oauthAccount.organizationRateLimitTier` found on the checked credentials file's parent path.
+
+Examples:
+
+```text
+plus                         -> plus
+default_claude_max_5x        -> max_5x
+default_claude_max_20x       -> max_20x
+```
+
+If no reliable local plan metadata exists, `PLAN` is `unknown`.
 
 Directory scans print results as each file completes. At the end they print:
 
