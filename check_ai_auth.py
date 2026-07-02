@@ -25,6 +25,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Any, Callable, Literal
 
 
@@ -208,11 +209,11 @@ def discover_auth_files(scan_dir: Path, kind: Provider) -> list[Path]:
     return sorted(candidates)
 
 
-def infer_provider(path: Path, payload: dict[str, Any], requested: Provider) -> str:
+def infer_provider(path: Path | str, payload: dict[str, Any], requested: Provider) -> str:
     if requested in {"codex", "claude"}:
         return requested
 
-    name = path.name
+    name = path.name if isinstance(path, Path) else path.split("/")[-1]
     if is_claude_auth_name(name):
         return "claude"
     if is_codex_auth_name(name):
@@ -366,7 +367,7 @@ def classify_codex(info: CodexTokenInfo, probe: DynamicProbe, min_valid_seconds:
 
 
 def make_codex_report(
-    auth_path: Path,
+    auth_path: Path | str,
     payload: dict[str, Any],
     *,
     min_valid_seconds: int,
@@ -459,7 +460,7 @@ def extract_claude_token_info(
     return "", None, ClaudeTokenInfo(False, None, None)
 
 
-def extract_claude_subscription(auth_path: Path, payload: dict[str, Any]) -> SubscriptionInfo:
+def extract_claude_subscription(auth_path: Path | str, payload: dict[str, Any]) -> SubscriptionInfo:
     for source, container in (
         ("claude_credentials_oauthToken", payload.get("oauthToken")),
         ("claude_credentials_claudeAiOauth", payload.get("claudeAiOauth")),
@@ -502,13 +503,18 @@ def extract_claude_subscription(auth_path: Path, payload: dict[str, Any]) -> Sub
     return SubscriptionInfo(plan="unknown", source="not_found")
 
 
-def find_claude_json_for_auth(auth_path: Path) -> Path | None:
-    resolved = auth_path.expanduser().resolve()
-    parents = [resolved.parent, *resolved.parents]
-    for parent in parents:
-        candidate = parent / ".claude.json"
-        if candidate.is_file():
-            return candidate
+def find_claude_json_for_auth(auth_path: Path | str) -> Path | None:
+    if isinstance(auth_path, str) and (auth_path.startswith("http://") or auth_path.startswith("https://")):
+        return None
+    try:
+        resolved = Path(auth_path).expanduser().resolve()
+        parents = [resolved.parent, *resolved.parents]
+        for parent in parents:
+            candidate = parent / ".claude.json"
+            if candidate.is_file():
+                return candidate
+    except Exception:
+        return None
     return None
 
 
@@ -650,7 +656,7 @@ def classify_claude(
 
 
 def make_claude_report(
-    auth_path: Path,
+    auth_path: Path | str,
     payload: dict[str, Any],
     *,
     min_valid_seconds: int,
@@ -716,8 +722,25 @@ def subscription_info_json(info: SubscriptionInfo) -> dict[str, Any]:
     }
 
 
+def fetch_json_from_url(url: str, timeout: float) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "ai-auth-check/1.0",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body = response.read(2_000_000)
+        value = json.loads(body.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("URL response root is not a JSON object")
+    return value
+
+
 def make_report(
-    auth_path: Path,
+    auth_path: Path | str,
     *,
     kind: Provider,
     min_valid_seconds: int,
@@ -725,7 +748,10 @@ def make_report(
     client_version: str,
     timeout: float,
 ) -> tuple[dict[str, Any], int]:
-    payload = load_json(auth_path)
+    if isinstance(auth_path, str) and (auth_path.startswith("http://") or auth_path.startswith("https://")):
+        payload = fetch_json_from_url(auth_path, timeout)
+    else:
+        payload = load_json(Path(auth_path))
     provider = infer_provider(auth_path, payload, kind)
     if provider == "codex":
         return make_codex_report(
@@ -747,7 +773,7 @@ def make_report(
     raise ValueError(f"unsupported provider: {provider}")
 
 
-def make_error_report(auth_path: Path, exc: Exception, kind: Provider) -> dict[str, Any]:
+def make_error_report(auth_path: Path | str, exc: Exception, kind: Provider) -> dict[str, Any]:
     return {
         "provider": kind,
         "status": "error",
@@ -755,6 +781,20 @@ def make_error_report(auth_path: Path, exc: Exception, kind: Provider) -> dict[s
         "auth_file": str(auth_path),
         "error": str(exc),
     }
+
+
+def emit_result(
+    on_result: Callable[[dict[str, Any]], None] | None,
+    report: dict[str, Any],
+    emit_lock: Any | None,
+) -> None:
+    if on_result is None:
+        return
+    if emit_lock is None:
+        on_result(report)
+        return
+    with emit_lock:
+        on_result(report)
 
 
 def make_scan_report(
@@ -765,12 +805,15 @@ def make_scan_report(
     no_network: bool,
     client_version: str,
     timeout: float,
+    workers: int = 1,
     on_result: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, Any], int]:
     auth_files = discover_auth_files(scan_dir, kind)
     results: list[dict[str, Any]] = []
     exit_codes: list[int] = []
-    for auth_path in auth_files:
+    emit_lock = Lock() if workers > 1 and on_result is not None else None
+
+    def process_path(auth_path: Path) -> tuple[dict[str, Any], int]:
         try:
             report, exit_code = make_report(
                 auth_path,
@@ -783,10 +826,22 @@ def make_scan_report(
         except Exception as exc:
             report = make_error_report(auth_path, exc, kind)
             exit_code = 2
-        results.append(report)
-        exit_codes.append(exit_code)
-        if on_result is not None:
-            on_result(report)
+        emit_result(on_result, report, emit_lock)
+        return report, exit_code
+
+    if workers > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(process_path, path): path for path in auth_files}
+            for future in as_completed(futures):
+                report, exit_code = future.result()
+                results.append(report)
+                exit_codes.append(exit_code)
+    else:
+        for auth_path in auth_files:
+            report, exit_code = process_path(auth_path)
+            results.append(report)
+            exit_codes.append(exit_code)
 
     status_counts: dict[str, int] = {}
     usable_count = 0
@@ -813,6 +868,85 @@ def make_scan_report(
             "scan_dir": str(scan_dir),
             "max_depth": 2,
             "auth_file_count": len(auth_files),
+            "usable_count": usable_count,
+            "status_counts": status_counts,
+            "auth_files": results,
+        },
+        overall_exit,
+    )
+
+
+def make_url_list_report(
+    urls: list[str],
+    url_list_path: Path,
+    *,
+    kind: Provider,
+    min_valid_seconds: int,
+    no_network: bool,
+    client_version: str,
+    timeout: float,
+    workers: int = 1,
+    on_result: Callable[[dict[str, Any]], None] | None = None,
+) -> tuple[dict[str, Any], int]:
+    results: list[dict[str, Any]] = []
+    exit_codes: list[int] = []
+    emit_lock = Lock() if workers > 1 and on_result is not None else None
+
+    def process_url(url: str) -> tuple[dict[str, Any], int]:
+        try:
+            report, exit_code = make_report(
+                url,
+                kind=kind,
+                min_valid_seconds=min_valid_seconds,
+                no_network=no_network,
+                client_version=client_version,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            report = make_error_report(url, exc, kind)
+            exit_code = 2
+        emit_result(on_result, report, emit_lock)
+        return report, exit_code
+
+    if workers > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(process_url, url): url for url in urls}
+            for future in as_completed(futures):
+                report, exit_code = future.result()
+                results.append(report)
+                exit_codes.append(exit_code)
+    else:
+        for url in urls:
+            report, exit_code = process_url(url)
+            results.append(report)
+            exit_codes.append(exit_code)
+
+    status_counts: dict[str, int] = {}
+    usable_count = 0
+    for result in results:
+        status = str(result.get("status", "unknown"))
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if status in USABLE_STATUSES:
+            usable_count += 1
+
+    if not urls:
+        overall_exit = 2
+    elif any(code in {1, 2} for code in exit_codes):
+        overall_exit = 1 if any(code == 1 for code in exit_codes) else 2
+    elif any(code == 3 for code in exit_codes):
+        overall_exit = 3
+    else:
+        overall_exit = 0
+
+    return (
+        {
+            "status": "ok" if overall_exit == 0 else "attention_required",
+            "checked_at": utc_now().isoformat(),
+            "provider": kind,
+            "scan_dir": str(url_list_path),
+            "max_depth": 1,
+            "auth_file_count": len(urls),
             "usable_count": usable_count,
             "status_counts": status_counts,
             "auth_files": results,
@@ -1069,6 +1203,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "-l",
+        "--url-list",
+        default=None,
+        help="Path to a text file containing a list of URLs to verify (one URL per line).",
+    )
+    parser.add_argument(
+        "-b",
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of concurrent workers for scanning or URL checking. Default: 1.",
+    )
+    parser.add_argument(
         "--min-valid-seconds",
         type=int,
         default=DEFAULT_MIN_VALID_SECONDS,
@@ -1117,6 +1264,71 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def run_once(args: argparse.Namespace) -> int:
     kind: Provider = args.kind
     color_enabled = resolve_color_enabled(args)
+    if args.url_list:
+        url_list_path = Path(args.url_list).expanduser()
+        if not url_list_path.exists():
+            raise ValueError(f"URL list file does not exist: {url_list_path}")
+
+        urls: list[str] = []
+        with url_list_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    urls.append(line)
+
+        if not args.json:
+            print_scan_start(
+                url_list_path,
+                kind=kind,
+                quiet=args.quiet,
+                color_enabled=color_enabled,
+            )
+        try:
+            report, exit_code = make_url_list_report(
+                urls,
+                url_list_path,
+                kind=kind,
+                min_valid_seconds=args.min_valid_seconds,
+                no_network=args.no_network,
+                client_version=args.client_version,
+                timeout=args.timeout,
+                workers=args.workers,
+                on_result=(
+                    None
+                    if args.json
+                    else lambda item: print_scan_item(
+                        item,
+                        quiet=args.quiet,
+                        color_enabled=color_enabled,
+                    )
+                ),
+            )
+        except Exception as exc:
+            report = {
+                "provider": kind,
+                "status": "error",
+                "checked_at": utc_now().isoformat(),
+                "scan_dir": str(url_list_path),
+                "error": str(exc),
+            }
+            if args.json:
+                print(json.dumps(report, ensure_ascii=False, indent=2))
+            elif args.quiet:
+                print("error")
+            else:
+                print(f"status: error\nerror: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            print_scan_summary(report, quiet=args.quiet)
+            print_usable_summary(
+                report,
+                quiet=args.quiet,
+                color_enabled=color_enabled,
+            )
+        return exit_code
+
     if args.dir:
         scan_dir = Path(args.dir).expanduser()
         if not args.json:
@@ -1134,6 +1346,7 @@ def run_once(args: argparse.Namespace) -> int:
                 no_network=args.no_network,
                 client_version=args.client_version,
                 timeout=args.timeout,
+                workers=args.workers,
                 on_result=(
                     None
                     if args.json

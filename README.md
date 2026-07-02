@@ -8,6 +8,8 @@ It supports:
 - Claude credentials files: `credentials.json`, `credentials.json.*`, `credentials1.json`, `.credentials.json`, `.credentials.json.*`, `.credentials1.json`
 - Single-file checks
 - Directory scans up to two subdirectory levels
+- URL list checks for remote JSON auth files
+- Optional concurrent checks with worker threads
 - Auto provider detection
 - Rolling terminal output during scans
 - JSON output for automation
@@ -30,6 +32,18 @@ Scan a directory containing multiple account folders:
 
 ```bash
 python3 auth-checker/check_ai_auth.py -k auto -d /path/to/accounts
+```
+
+Check auth JSON files from a URL list:
+
+```bash
+python3 auth-checker/check_ai_auth.py -k auto -l ./auth-urls.txt
+```
+
+Scan faster with concurrent workers:
+
+```bash
+python3 auth-checker/check_ai_auth.py -k auto -d /path/to/accounts --workers 8
 ```
 
 Force color output:
@@ -95,6 +109,20 @@ Claude:
   .credentials2.json
 ```
 
+## URL List Rules
+
+`-l FILE` reads one HTTP or HTTPS URL per line and downloads each URL as a JSON object.
+
+```text
+https://example.com/account-a/auth.json
+https://example.com/account-b/.credentials.json
+# blank lines and full-line comments are ignored
+```
+
+URL checks support the same provider detection, expiry checks, network probes, color output, JSON output, and usable summary as directory scans.
+
+Use `--workers N` to check several files or URLs concurrently. Values greater than `1` enable concurrency. Rolling output is printed as each check finishes, so concurrent output is completion order, not input order.
+
 ## Output
 
 Human output is a table:
@@ -128,7 +156,7 @@ default_claude_max_20x       -> max_20x
 
 If no reliable local plan metadata exists, `PLAN` is `unknown`.
 
-Directory scans print results as each file completes. At the end they print:
+Directory scans and URL-list checks print results as each file or URL completes. At the end they print:
 
 ```text
 summary: usable=2/3 status=attention_required provider=auto scan_dir=/path
@@ -176,6 +204,7 @@ python3 auth-checker/check_ai_auth.py -k auto -d /path/to/accounts --no-network
 - It does not call Claude CLI.
 - It does not write back to any auth file.
 - It never prints token, refresh token, API key, or OAuth secret values.
+- URL-list mode downloads credential JSON from the listed URLs. Only use trusted URLs, prefer HTTPS, and do not publish auth files publicly.
 
 ## Useful Examples
 
@@ -189,6 +218,12 @@ Quiet output for shell scripts:
 
 ```bash
 python3 auth-checker/check_ai_auth.py -k auto -d /path/to/accounts --quiet --color never
+```
+
+Concurrent URL-list check:
+
+```bash
+python3 auth-checker/check_ai_auth.py -k auto -l ./auth-urls.txt --workers 8
 ```
 
 Check a copied Codex auth file:
