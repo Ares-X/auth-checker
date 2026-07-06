@@ -207,6 +207,8 @@ For directory scans, the exit code summarizes the whole scan.
 
 ## Network Checks
 
+The script disables HTTPS certificate verification globally for its `urllib` requests. This allows auth URLs with hostname-mismatched or otherwise invalid certificates to be checked, but it also means TLS certificate errors will not stop URL downloads or backend probes.
+
 Codex:
 
 - Decodes local JWT metadata.
@@ -236,6 +238,7 @@ python3 auth-checker/check_ai_auth.py -k auto -d /path/to/accounts --no-network
 - URL-list mode downloads credential JSON from the listed URLs. Only use trusted URLs, prefer HTTPS, and do not publish auth files publicly.
 - URL-list mode saves usable downloaded auth files by default under `saved-url-auths/`. That directory is ignored by this repository's `.gitignore`.
 - Use `-ns` when you want URL checks without local credential copies.
+- HTTPS certificate verification is disabled globally. Only run this against URLs and networks you trust.
 
 ## Useful Examples
 

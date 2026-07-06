@@ -18,6 +18,7 @@ import base64
 import datetime as dt
 import json
 import os
+import ssl
 import sys
 import time
 import urllib.error
@@ -46,6 +47,11 @@ COLOR_RED = "\033[31m"
 COLOR_YELLOW = "\033[33m"
 COLOR_DIM = "\033[2m"
 COLOR_RESET = "\033[0m"
+
+# Some auth URLs are served behind hosts with mismatched certificates. This
+# tool is a local convenience checker, so HTTPS certificate verification is
+# disabled globally for urllib requests.
+ssl._create_default_https_context = ssl._create_unverified_context
 
 
 @dataclass(frozen=True)
